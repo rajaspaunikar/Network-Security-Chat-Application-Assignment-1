@@ -1,0 +1,2 @@
+Challenges Faced
+1. New line automatically getting added in the buffer message and then into the map while storing the username with their socket fds. So while laster looking up that username using the map_name.find() we couldn't match the name. Introduced trim function to tackle it.
