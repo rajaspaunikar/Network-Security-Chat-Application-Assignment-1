@@ -11,6 +11,8 @@
 #include <cctype>
 #include <algorithm>
 #include <csignal>
+#include <cstdint>   
+#include <memory>   
 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -77,11 +79,76 @@ std::vector<std::string> parse_frame(const std::string& raw) {
 }
 
 
-bool safe_send(int fd, const std::string& msg) {
-    ssize_t n = send(fd, msg.c_str(), msg.size(), MSG_NOSIGNAL); //Do not raise SIGPIPE if connection already closed
-    return n == static_cast<ssize_t>(msg.size());
+
+static const size_t MAX_MSG_SIZE = 1 << 20; // CHANGED: 1 MB sanity cap - rejects a corrupt/garbage length header instead of trying to allocate an insane amount of memory
+
+
+ssize_t recv_exact(int fd, void* buf, size_t n) {
+    size_t got = 0;
+    char* p = static_cast<char*>(buf);
+    while (got < n) {
+        ssize_t r = recv(fd, p + got, n - got, 0);
+        if (r <= 0) return r; // 0 = peer closed cleanly, <0 = error
+        got += static_cast<size_t>(r);
+    }
+    return static_cast<ssize_t>(got);
 }
 
+
+bool send_exact(int fd, const void* buf, size_t n) {
+    size_t sent = 0;
+    const char* p = static_cast<const char*>(buf);
+    while (sent < n) {
+        ssize_t s = send(fd, p + sent, n - sent, MSG_NOSIGNAL); // Do not raise SIGPIPE if connection already closed
+        if (s <= 0) return false;
+        sent += static_cast<size_t>(s);
+    }
+    return true;
+}
+
+
+std::mutex send_mutexes_guard;
+std::unordered_map<int, std::shared_ptr<std::mutex>> send_mutexes;
+
+std::shared_ptr<std::mutex> get_send_mutex(int fd) {
+    std::lock_guard<std::mutex> lock(send_mutexes_guard);
+    auto it = send_mutexes.find(fd);
+    if (it != send_mutexes.end()) return it->second;
+    auto m = std::make_shared<std::mutex>();
+    send_mutexes[fd] = m;
+    return m;
+}
+
+
+void remove_send_mutex(int fd) {
+    std::lock_guard<std::mutex> lock(send_mutexes_guard);
+    send_mutexes.erase(fd);
+}
+
+
+bool send_framed(int fd, const std::string& payload) {
+    uint32_t len = htonl(static_cast<uint32_t>(payload.size()));
+    if (!send_exact(fd, &len, sizeof(len))) return false;
+    return send_exact(fd, payload.data(), payload.size());
+}
+
+
+bool send_framed_safe(int fd, const std::string& payload) {
+    auto m = get_send_mutex(fd);
+    std::lock_guard<std::mutex> lock(*m);
+    return send_framed(fd, payload);
+}
+
+
+bool recv_framed(int fd, std::string& out) {
+    uint32_t len_net;
+    if (recv_exact(fd, &len_net, sizeof(len_net)) <= 0) return false;
+    uint32_t len = ntohl(len_net);
+    if (len > MAX_MSG_SIZE) return false;
+    out.resize(len);
+    if (len == 0) return true; // an empty payload is a valid (if unusual) frame
+    return recv_exact(fd, out.data(), len) > 0;
+}
 
 std::unordered_map<std::string, int> clients;
 std::mutex clients_mutex;
@@ -108,11 +175,11 @@ void route_message(const std::string& from, const std::string& to, const std::st
 
     if (target_fd == -1) {
         log(LogLevel::WARN, to + " is not online (message from " + from + " dropped)");
-        if (sender_fd != -1) safe_send(sender_fd, "ERROR|" + to + " is not online");
+        if (sender_fd != -1) send_framed_safe(sender_fd, "ERROR|" + to + " is not online"); // CHANGED: safe_send -> send_framed
         return;
     }
 
-    safe_send(target_fd, "MSG|" + from + "|" + content);
+    send_framed_safe(target_fd, "MSG|" + from + "|" + content); // CHANGED: safe_send -> send_framed
 }
 
 void handle_who(int requester_fd, const std::string& requester_name) {
@@ -125,20 +192,19 @@ void handle_who(int requester_fd, const std::string& requester_name) {
             list += client.first;
         }
     }
-    safe_send(requester_fd, "WHO_RESP|" + list);
+    send_framed_safe(requester_fd, "WHO_RESP|" + list); // CHANGED: safe_send -> send_framed
     log(LogLevel::DEBUG, requester_name + " requested /who -> [" + list + "]");
 }
 
 //Per client thread
 void handle_client(int client_fd) {
-    char buf[4096];
-    int n = recv(client_fd, buf, sizeof(buf) - 1, 0);
-    if (n <= 0) { close(client_fd); return; }
-    buf[n] = '\0';
 
-    auto reg_parts = parse_frame(std::string(buf));
+    std::string frame;
+    if (!recv_framed(client_fd, frame)) { close(client_fd); return; }
+
+    auto reg_parts = parse_frame(frame);
     if (reg_parts.empty() || reg_parts[0] != "REGISTER" || reg_parts.size() < 2 || reg_parts[1].empty()) {
-        safe_send(client_fd, "ERROR|Expected REGISTER|<username> as first message");
+        send_framed_safe(client_fd, "ERROR|Expected REGISTER|<username> as first message"); // CHANGED: safe_send -> send_framed
         close(client_fd);
         return;
     }
@@ -147,25 +213,22 @@ void handle_client(int client_fd) {
     {
         std::lock_guard<std::mutex> lock(clients_mutex);
         if (clients.count(username)) {
-            safe_send(client_fd, "ERROR|username already taken");
+            send_framed_safe(client_fd, "ERROR|username already taken"); // CHANGED: safe_send -> send_framed
             close(client_fd);
             return;
         }
         clients[username] = client_fd;
     }
     log(LogLevel::INFO, username + " connected.");
-    safe_send(client_fd, "REGISTER_OK|" + username);
+    send_framed_safe(client_fd, "REGISTER_OK|" + username); // CHANGED: safe_send -> send_framed
     debug_print_clients();
 
-    while (true) {
-        n = recv(client_fd, buf, sizeof(buf) - 1, 0);
-        if (n <= 0) {
-            log(LogLevel::INFO, username + " connection closed.");
-            break;
-        }
-        buf[n] = '\0';
-        std::string raw(buf);
-        auto parts = parse_frame(raw);
+    // CHANGED: loop condition now calls recv_framed() directly instead of
+    // raw recv() + manual null-termination. Each successful call returns one
+    // complete frame in `frame`, regardless of how many TCP segments/recv()
+    // calls it took under the hood to assemble it.
+    while (recv_framed(client_fd, frame)) {
+        auto parts = parse_frame(frame);
         if (parts.empty()) continue;
 
         const std::string& type = parts[0];
@@ -181,14 +244,16 @@ void handle_client(int client_fd) {
             break;
         }
         else {
-            log(LogLevel::WARN, "Unrecognized frame from " + username + ": " + raw);
+            log(LogLevel::WARN, "Unrecognized frame from " + username + ": " + frame);
         }
     }
+    log(LogLevel::INFO, username + " connection closed."); // CHANGED: moved out of the old raw-recv branch since recv_framed's loop condition now handles the "connection closed" exit implicitly
 
     {
         std::lock_guard<std::mutex> lock(clients_mutex);
         clients.erase(username);
     }
+    remove_send_mutex(client_fd); // CHANGED (concurrency fix): clean up this fd's send mutex now that the connection is done
     close(client_fd);
     log(LogLevel::INFO, username + " disconnected.");
     debug_print_clients();

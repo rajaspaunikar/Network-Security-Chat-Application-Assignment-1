@@ -6,6 +6,7 @@
 #include <thread>
 #include <cctype>
 #include <csignal>
+#include <cstdint>  
 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -38,15 +39,57 @@ std::vector<std::string> parse_frame(const std::string& raw) {
     return parts;
 }
 
-bool safe_send(int fd, const std::string& msg) {
-    ssize_t n = send(fd, msg.c_str(), msg.size(), MSG_NOSIGNAL);
-    return n == static_cast<ssize_t>(msg.size());
+
+
+// Wire format: [4 bytes: payload length, network byte order][payload]
+// ---------------------------------------------------------------------------
+
+static const size_t MAX_MSG_SIZE = 1 << 20; 
+
+
+ssize_t recv_exact(int fd, void* buf, size_t n) {
+    size_t got = 0;
+    char* p = static_cast<char*>(buf);
+    while (got < n) {
+        ssize_t r = recv(fd, p + got, n - got, 0);
+        if (r <= 0) return r;
+        got += static_cast<size_t>(r);
+    }
+    return static_cast<ssize_t>(got);
+}
+
+
+bool send_exact(int fd, const void* buf, size_t n) {
+    size_t sent = 0;
+    const char* p = static_cast<const char*>(buf);
+    while (sent < n) {
+        ssize_t s = send(fd, p + sent, n - sent, MSG_NOSIGNAL);
+        if (s <= 0) return false;
+        sent += static_cast<size_t>(s);
+    }
+    return true;
+}
+
+bool send_framed(int fd, const std::string& payload) {
+    uint32_t len = htonl(static_cast<uint32_t>(payload.size()));
+    if (!send_exact(fd, &len, sizeof(len))) return false;
+    return send_exact(fd, payload.data(), payload.size());
+}
+
+bool recv_framed(int fd, std::string& out) {
+    uint32_t len_net;
+    if (recv_exact(fd, &len_net, sizeof(len_net)) <= 0) return false;
+    uint32_t len = ntohl(len_net);
+    if (len > MAX_MSG_SIZE) return false;
+    out.resize(len);
+    if (len == 0) return true;
+    return recv_exact(fd, out.data(), len) > 0;
 }
 
 // ---------------------------------------------------------------------------
 // Client-local state
 // ---------------------------------------------------------------------------
-std::string current_partner;          
+std::string current_partner;
 std::atomic<bool> running{true};
 
 // ---------------------------------------------------------------------------
@@ -54,16 +97,15 @@ std::atomic<bool> running{true};
 // /who responses, errors) while the main thread waits on stdin.
 // ---------------------------------------------------------------------------
 void receiver_loop(int sockfd) {
-    char buf[4096];
+
+    std::string frame;
     while (running) {
-        int n = recv(sockfd, buf, sizeof(buf) - 1, 0);
-        if (n <= 0) {
+        if (!recv_framed(sockfd, frame)) {
             if (running) std::cout << "\n[Disconnected from server]\n";
             running = false;
             break;
         }
-        buf[n] = '\0';
-        auto parts = parse_frame(std::string(buf));
+        auto parts = parse_frame(frame);
         if (parts.empty()) continue;
 
         const std::string& type = parts[0];
@@ -95,24 +137,24 @@ bool process_user_input(int sockfd, const std::string& line) {
         }
         current_partner = line.substr(1, space - 1);
         std::string content = line.substr(space + 1);
-        safe_send(sockfd, "MSG|" + current_partner + "|" + content);
+        send_framed(sockfd, "MSG|" + current_partner + "|" + content); // CHANGED: safe_send -> send_framed
     }
     else if (line.rfind("/chat ", 0) == 0) {   // starts with "/chat "
         current_partner = trim(line.substr(6));
         std::cout << "Now chatting with " << current_partner << "\n";
     }
     else if (line == "/who") {
-        safe_send(sockfd, "WHO|");
+        send_framed(sockfd, "WHO|"); // CHANGED: safe_send -> send_framed
     }
     else if (line == "/quit") {
-        safe_send(sockfd, "QUIT|");
+        send_framed(sockfd, "QUIT|"); // CHANGED: safe_send -> send_framed
         return false; // signal caller to stop
     }
     else {
         if (current_partner.empty()) {
             std::cout << "No chat partner selected. Use @username or /chat username first.\n";
         } else {
-            safe_send(sockfd, "MSG|" + current_partner + "|" + line);
+            send_framed(sockfd, "MSG|" + current_partner + "|" + line); // CHANGED: safe_send -> send_framed
         }
     }
     return true;
@@ -148,20 +190,20 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    if (!safe_send(sockfd, "REGISTER|" + my_username)) {
+    if (!send_framed(sockfd, "REGISTER|" + my_username)) { // CHANGED: safe_send -> send_framed
         std::cerr << "Failed to send registration\n";
         return 1;
     }
-    char buf[4096];
-    int n = recv(sockfd, buf, sizeof(buf) - 1, 0);
-    if (n <= 0) {
+
+
+    std::string reply;
+    if (!recv_framed(sockfd, reply)) {
         std::cerr << "Server closed connection during registration\n";
         return 1;
     }
-    buf[n] = '\0';
-    auto parts = parse_frame(std::string(buf));
+    auto parts = parse_frame(reply);
     if (parts.empty() || parts[0] != "REGISTER_OK") {
-        std::cerr << "Registration failed: " << std::string(buf) << "\n";
+        std::cerr << "Registration failed: " << reply << "\n";
         close(sockfd);
         return 1;
     }
