@@ -13,4 +13,5 @@ BIGNUM* dh_compute_shared_secret(const BIGNUM* their_pub, const BIGNUM* my_priv,
 BIGNUM* dh_load_prime();
 BIGNUM* dh_load_generator();
 std::string dh_bn_to_hex(const BIGNUM* bn);
+std::string dh_sha256_fingerprint(const BIGNUM* secret);
 void dh_free_keypair(DHKeyPair& kp);

@@ -1,6 +1,9 @@
 #include "dh.h"
 #include "dh_group_14.h"
 #include <cstring>
+#include <openssl/sha.h>
+#include <sstream>
+#include <iomanip>
 
 BIGNUM* dh_load_prime() {
     BIGNUM* p = nullptr;
@@ -44,4 +47,16 @@ void dh_free_keypair(DHKeyPair& kp) {
     BN_free(kp.pub);
     kp.priv = nullptr;
     kp.pub = nullptr;
+}
+
+std::string dh_sha256_fingerprint(const BIGNUM* secret) {
+    std::string hex = dh_bn_to_hex(secret);
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    SHA256(reinterpret_cast<const unsigned char*>(hex.data()), hex.size(), hash);
+
+    std::ostringstream oss;
+    for (int i = 0; i < 8; i++) {
+        oss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(hash[i]);
+    }
+    return oss.str();
 }
