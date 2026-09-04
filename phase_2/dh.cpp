@@ -4,6 +4,7 @@
 #include <openssl/sha.h>
 #include <sstream>
 #include <iomanip>
+#include <vector>
 
 BIGNUM* dh_load_prime() {
     BIGNUM* p = nullptr;
@@ -59,4 +60,11 @@ std::string dh_sha256_fingerprint(const BIGNUM* secret) {
         oss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(hash[i]);
     }
     return oss.str();
+}
+
+void dh_derive_aes_key(const BIGNUM* secret, unsigned char* key_out_32bytes) {
+    int byte_len = BN_num_bytes(secret);
+    std::vector<unsigned char> raw(byte_len);
+    BN_bn2bin(secret, raw.data());
+    SHA256(raw.data(), raw.size(), key_out_32bytes);
 }

@@ -13,6 +13,7 @@
 #include <csignal>
 #include <cstdint>
 #include <memory>
+#include <array>
 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -21,6 +22,7 @@
 
 #include <openssl/bn.h>
 #include "dh.h"
+#include "crypto.h"
 
 std::mutex log_mutex;
 
@@ -135,8 +137,43 @@ bool recv_framed(int fd, std::string& out) {
     return recv_exact(fd, out.data(), len) > 0;
 }
 
+bool send_encrypted(int fd, const unsigned char* key, const std::string& payload) {
+    std::string blob;
+    if (!aes_gcm_encrypt(key, payload, blob)) return false;
+    return send_framed_safe(fd, blob);
+}
+
+bool recv_encrypted(int fd, const unsigned char* key, std::string& out) {
+    std::string blob;
+    if (!recv_framed(fd, blob)) return false;
+    return aes_gcm_decrypt(key, blob, out);
+}
+
 std::unordered_map<std::string, int> clients;
 std::mutex clients_mutex;
+
+std::mutex keys_mutex;
+std::unordered_map<int, std::array<unsigned char, 32>> client_keys;
+
+void store_key(int fd, const unsigned char* key) {
+    std::lock_guard<std::mutex> lock(keys_mutex);
+    std::array<unsigned char, 32> arr;
+    std::memcpy(arr.data(), key, 32);
+    client_keys[fd] = arr;
+}
+
+bool get_key(int fd, unsigned char* out) {
+    std::lock_guard<std::mutex> lock(keys_mutex);
+    auto it = client_keys.find(fd);
+    if (it == client_keys.end()) return false;
+    std::memcpy(out, it->second.data(), 32);
+    return true;
+}
+
+void remove_key(int fd) {
+    std::lock_guard<std::mutex> lock(keys_mutex);
+    client_keys.erase(fd);
+}
 
 void debug_print_clients() {
     std::lock_guard<std::mutex> lock(clients_mutex);
@@ -160,11 +197,19 @@ void route_message(const std::string& from, const std::string& to, const std::st
 
     if (target_fd == -1) {
         log(LogLevel::WARN, to + " is not online (message from " + from + " dropped)");
-        if (sender_fd != -1) send_framed_safe(sender_fd, "ERROR|" + to + " is not online");
+        if (sender_fd != -1) {
+            unsigned char key[32];
+            if (get_key(sender_fd, key)) {
+                send_encrypted(sender_fd, key, "ERROR|" + to + " is not online");
+            }
+        }
         return;
     }
 
-    send_framed_safe(target_fd, "MSG|" + from + "|" + content);
+    unsigned char target_key[32];
+    if (get_key(target_fd, target_key)) {
+        send_encrypted(target_fd, target_key, "MSG|" + from + "|" + content);
+    }
 }
 
 void handle_who(int requester_fd, const std::string& requester_name) {
@@ -177,7 +222,10 @@ void handle_who(int requester_fd, const std::string& requester_name) {
             list += client.first;
         }
     }
-    send_framed_safe(requester_fd, "WHO_RESP|" + list);
+    unsigned char key[32];
+    if (get_key(requester_fd, key)) {
+        send_encrypted(requester_fd, key, "WHO_RESP|" + list);
+    }
     log(LogLevel::DEBUG, requester_name + " requested /who -> [" + list + "]");
 }
 
@@ -219,9 +267,14 @@ void handle_client(int client_fd, BIGNUM* p, BIGNUM* g) {
 
     log(LogLevel::INFO, "DH shared secret fingerprint: " + dh_sha256_fingerprint(shared_secret));
 
+    unsigned char aes_key[32];
+    dh_derive_aes_key(shared_secret, aes_key);
+    store_key(client_fd, aes_key);
+
     std::string frame;
-    if (!recv_framed(client_fd, frame)) {
+    if (!recv_encrypted(client_fd, aes_key, frame)) {
         BN_free(shared_secret);
+        remove_key(client_fd);
         BN_CTX_free(ctx);
         close(client_fd);
         return;
@@ -229,8 +282,9 @@ void handle_client(int client_fd, BIGNUM* p, BIGNUM* g) {
 
     auto reg_parts = parse_frame(frame);
     if (reg_parts.empty() || reg_parts[0] != "REGISTER" || reg_parts.size() < 2 || reg_parts[1].empty()) {
-        send_framed_safe(client_fd, "ERROR|Expected REGISTER|<username> as first message");
+        send_encrypted(client_fd, aes_key, "ERROR|Expected REGISTER|<username> as first message");
         BN_free(shared_secret);
+        remove_key(client_fd);
         BN_CTX_free(ctx);
         close(client_fd);
         return;
@@ -240,8 +294,9 @@ void handle_client(int client_fd, BIGNUM* p, BIGNUM* g) {
     {
         std::lock_guard<std::mutex> lock(clients_mutex);
         if (clients.count(username)) {
-            send_framed_safe(client_fd, "ERROR|username already taken");
+            send_encrypted(client_fd, aes_key, "ERROR|username already taken");
             BN_free(shared_secret);
+            remove_key(client_fd);
             BN_CTX_free(ctx);
             close(client_fd);
             return;
@@ -249,10 +304,10 @@ void handle_client(int client_fd, BIGNUM* p, BIGNUM* g) {
         clients[username] = client_fd;
     }
     log(LogLevel::INFO, username + " connected.");
-    send_framed_safe(client_fd, "REGISTER_OK|" + username);
+    send_encrypted(client_fd, aes_key, "REGISTER_OK|" + username);
     debug_print_clients();
 
-    while (recv_framed(client_fd, frame)) {
+    while (recv_encrypted(client_fd, aes_key, frame)) {
         auto parts = parse_frame(frame);
         if (parts.empty()) continue;
 
@@ -279,6 +334,7 @@ void handle_client(int client_fd, BIGNUM* p, BIGNUM* g) {
         clients.erase(username);
     }
     remove_send_mutex(client_fd);
+    remove_key(client_fd);
     BN_free(shared_secret);
     BN_CTX_free(ctx);
     close(client_fd);

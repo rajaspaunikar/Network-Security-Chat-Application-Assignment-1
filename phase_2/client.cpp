@@ -15,6 +15,7 @@
 
 #include <openssl/bn.h>
 #include "dh.h"
+#include "crypto.h"
 
 std::string trim(const std::string& s) {
     size_t start = 0, end = s.size();
@@ -82,13 +83,27 @@ bool recv_framed(int fd, std::string& out) {
     return recv_exact(fd, out.data(), len) > 0;
 }
 
+unsigned char g_aes_key[32];
+
+bool send_encrypted(int fd, const std::string& payload) {
+    std::string blob;
+    if (!aes_gcm_encrypt(g_aes_key, payload, blob)) return false;
+    return send_framed(fd, blob);
+}
+
+bool recv_encrypted(int fd, std::string& out) {
+    std::string blob;
+    if (!recv_framed(fd, blob)) return false;
+    return aes_gcm_decrypt(g_aes_key, blob, out);
+}
+
 std::string current_partner;
 std::atomic<bool> running{true};
 
 void receiver_loop(int sockfd) {
     std::string frame;
     while (running) {
-        if (!recv_framed(sockfd, frame)) {
+        if (!recv_encrypted(sockfd, frame)) {
             if (running) std::cout << "\n[Disconnected from server]\n";
             running = false;
             break;
@@ -122,24 +137,24 @@ bool process_user_input(int sockfd, const std::string& line) {
         }
         current_partner = line.substr(1, space - 1);
         std::string content = line.substr(space + 1);
-        send_framed(sockfd, "MSG|" + current_partner + "|" + content);
+        send_encrypted(sockfd, "MSG|" + current_partner + "|" + content);
     }
     else if (line.rfind("/chat ", 0) == 0) {
         current_partner = trim(line.substr(6));
         std::cout << "Now chatting with " << current_partner << "\n";
     }
     else if (line == "/who") {
-        send_framed(sockfd, "WHO|");
+        send_encrypted(sockfd, "WHO|");
     }
     else if (line == "/quit") {
-        send_framed(sockfd, "QUIT|");
+        send_encrypted(sockfd, "QUIT|");
         return false;
     }
     else {
         if (current_partner.empty()) {
             std::cout << "No chat partner selected. Use @username or /chat username first.\n";
         } else {
-            send_framed(sockfd, "MSG|" + current_partner + "|" + line);
+            send_encrypted(sockfd, "MSG|" + current_partner + "|" + line);
         }
     }
     return true;
@@ -221,13 +236,15 @@ int main(int argc, char** argv) {
 
     std::cout << "DH shared secret fingerprint: " << dh_sha256_fingerprint(shared_secret) << "\n";
 
-    if (!send_framed(sockfd, "REGISTER|" + my_username)) {
+    dh_derive_aes_key(shared_secret, g_aes_key);
+
+    if (!send_encrypted(sockfd, "REGISTER|" + my_username)) {
         std::cerr << "Failed to send registration\n";
         return 1;
     }
 
     std::string reply;
-    if (!recv_framed(sockfd, reply)) {
+    if (!recv_encrypted(sockfd, reply)) {
         std::cerr << "Server closed connection during registration\n";
         return 1;
     }
