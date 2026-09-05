@@ -126,6 +126,7 @@ struct PendingRekey {
     int target_generation;
 };
 std::unordered_map<std::string, PendingRekey> pending_e2e_keypairs;
+std::unordered_map<std::string, bool> rekey_timer_started;
 
 std::string bytes_to_hex(const std::string& data) {
     std::ostringstream oss;
@@ -180,6 +181,8 @@ bool i_am_initiator(const std::string& peer) {
     return g_my_username < peer;
 }
 
+void rekey_timer_loop(int sockfd, std::string peer);
+
 void handle_e2e_init(int sockfd, const std::string& peer, const std::string& payload) {
     size_t sep = payload.find('|');
     if (sep == std::string::npos) return;
@@ -216,6 +219,18 @@ void handle_e2e_init(int sockfd, const std::string& peer, const std::string& pay
     std::cout << "\n[" << timestamp_now() << "] [E2E] Key established with " << peer
               << " (generation " << target_gen << "). Fingerprint: "
               << dh_sha256_fingerprint(shared) << "\n> " << std::flush;
+
+    bool need_to_start_timer = false;
+    {
+        std::lock_guard<std::mutex> lock(e2e_mutex);
+        if (!rekey_timer_started[peer]) {
+            rekey_timer_started[peer] = true;
+            need_to_start_timer = true;
+        }
+    }
+    if (need_to_start_timer) {
+        std::thread(rekey_timer_loop, sockfd, peer).detach();
+    }
 
     send_encrypted(sockfd, "MSG|" + peer + "|__E2E_ACK__" + std::to_string(target_gen) + "|" + dh_bn_to_hex(my_kp.pub));
 
@@ -375,7 +390,17 @@ bool process_user_input(int sockfd, const std::string& line) {
         std::string peer = trim(line.substr(5));
         initiate_e2e(sockfd, peer, 1);
         std::cout << "E2E key exchange initiated with " << peer << "\n";
-        std::thread(rekey_timer_loop, sockfd, peer).detach();
+        bool need_to_start_timer = false;
+        {
+            std::lock_guard<std::mutex> lock(e2e_mutex);
+            if (!rekey_timer_started[peer]) {
+                rekey_timer_started[peer] = true;
+                need_to_start_timer = true;
+            }
+        }
+        if (need_to_start_timer) {
+            std::thread(rekey_timer_loop, sockfd, peer).detach();
+        }
         return true;
     }
 
