@@ -14,8 +14,8 @@
 #include <unistd.h>
 
 #include <openssl/bn.h>
-#include "dh.h"
-#include "crypto.h"
+#include "dh/dh.h"
+#include "crypto/crypto.h"
 #include "cert.h"
 
 std::string trim(const std::string& s) {
@@ -221,7 +221,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    X509* ca_cert = cert_load_from_file("ca_cert.pem");
+    X509* ca_cert = cert_load_from_file("certs/ca_cert.pem");
     if (!ca_cert) {
         std::cerr << "Could not load trusted CA certificate (ca_cert.pem)\n";
         close(sockfd);

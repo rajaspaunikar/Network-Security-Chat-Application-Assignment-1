@@ -2,8 +2,8 @@
 #include <iostream>
 
 int main() {
-    X509* ca_cert = cert_load_from_file("ca_cert.pem");
-    X509* server_cert = cert_load_from_file("server_cert.pem");
+    X509* ca_cert = cert_load_from_file("certs/ca_cert.pem");
+    X509* server_cert = cert_load_from_file("certs/server_cert.pem");
 
     std::cout << "Server cert CN: " << cert_get_cn(server_cert) << "\n";
 

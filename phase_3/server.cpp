@@ -21,8 +21,8 @@
 #include <unistd.h>
 
 #include <openssl/bn.h>
-#include "dh.h"
-#include "crypto.h"
+#include "dh/dh.h"
+#include "crypto/crypto.h"
 #include "cert.h"
 
 std::mutex log_mutex;
@@ -360,7 +360,7 @@ int main(int argc, char** argv) {
 
     BIGNUM* p = dh_load_prime();
     BIGNUM* g = dh_load_generator();
-    std::string cert_pem = read_file_to_string("server_cert.pem");
+    std::string cert_pem = read_file_to_string("certs/server_cert.pem");
     if (cert_pem.empty()) {
         std::cerr << "Could not read server_cert.pem\n";
         return 1;
