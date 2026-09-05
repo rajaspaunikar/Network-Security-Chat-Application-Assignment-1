@@ -114,6 +114,41 @@ struct E2ESession {
 std::unordered_map<std::string, E2ESession> e2e_sessions;
 std::unordered_map<std::string, DHKeyPair> pending_e2e_keypairs;
 
+std::string bytes_to_hex(const std::string& data) {
+    std::ostringstream oss;
+    for (unsigned char c : data) oss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(c);
+    return oss.str();
+}
+
+std::string hex_to_bytes(const std::string& hex) {
+    std::string out;
+    for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+        out.push_back(static_cast<char>(std::stoi(hex.substr(i, 2), nullptr, 16)));
+    }
+    return out;
+}
+
+bool send_chat_message(int sockfd, const std::string& peer, const std::string& content) {
+    bool has_e2e = false;
+    unsigned char e2e_key[32];
+    {
+        std::lock_guard<std::mutex> lock(e2e_mutex);
+        auto it = e2e_sessions.find(peer);
+        if (it != e2e_sessions.end() && it->second.established) {
+            has_e2e = true;
+            std::memcpy(e2e_key, it->second.key, 32);
+        }
+    }
+
+    if (has_e2e) {
+        std::string blob;
+        if (!aes_gcm_encrypt(e2e_key, content, blob)) return false;
+        return send_encrypted(sockfd, "MSG|" + peer + "|__E2E_MSG__" + bytes_to_hex(blob));
+    } else {
+        return send_encrypted(sockfd, "MSG|" + peer + "|" + content);
+    }
+}
+
 BN_CTX* g_e2e_ctx = nullptr;
 BIGNUM* g_e2e_p = nullptr;
 BIGNUM* g_e2e_g = nullptr;
@@ -201,6 +236,33 @@ void receiver_loop(int sockfd) {
             else if (content.rfind("__E2E_ACK__", 0) == 0) {
                 handle_e2e_ack(sender, content.substr(11));
             }
+            else if (content.rfind("__E2E_MSG__", 0) == 0) {
+                std::string hex_blob = content.substr(11);
+                std::string blob = hex_to_bytes(hex_blob);
+
+                bool has_e2e = false;
+                unsigned char e2e_key[32];
+                {
+                    std::lock_guard<std::mutex> lock(e2e_mutex);
+                    auto it = e2e_sessions.find(sender);
+                    if (it != e2e_sessions.end() && it->second.established) {
+                        has_e2e = true;
+                        std::memcpy(e2e_key, it->second.key, 32);
+                    }
+                }
+
+                if (!has_e2e) {
+                    std::cout << "\n[E2E] Received an E2E message from " << sender
+                              << " but no session exists. Ignoring.\n> " << std::flush;
+                } else {
+                    std::string plaintext;
+                    if (aes_gcm_decrypt(e2e_key, blob, plaintext)) {
+                        std::cout << "\n[" << sender << " (E2E)] " << plaintext << "\n> " << std::flush;
+                    } else {
+                        std::cout << "\n[E2E] Failed to decrypt message from " << sender << ".\n> " << std::flush;
+                    }
+                }
+            }
             else {
                 std::cout << "\n[" << sender << "] " << content << "\n> " << std::flush;
             }
@@ -239,7 +301,7 @@ bool process_user_input(int sockfd, const std::string& line) {
         }
         current_partner = line.substr(1, space - 1);
         std::string content = line.substr(space + 1);
-        send_encrypted(sockfd, "MSG|" + current_partner + "|" + content);
+        send_chat_message(sockfd, current_partner, content);
     }
     else if (line.rfind("/chat ", 0) == 0) {
         current_partner = trim(line.substr(6));
@@ -256,7 +318,7 @@ bool process_user_input(int sockfd, const std::string& line) {
         if (current_partner.empty()) {
             std::cout << "No chat partner selected. Use @username or /chat username first.\n";
         } else {
-            send_encrypted(sockfd, "MSG|" + current_partner + "|" + line);
+            send_chat_message(sockfd, current_partner, line);
         }
     }
     return true;
