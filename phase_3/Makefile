@@ -4,7 +4,7 @@ LDFLAGS = -lcrypto
 
 COMMON_SRCS = cert.cpp crypto/crypto.cpp dh/dh.cpp
 
-TARGETS = server client test_cert fake_server test_pop fake_server_stolen_cert
+TARGETS = server client test_cert fake_server test_pop fake_server_stolen_cert mitm_proxy
 
 .PHONY: all clean certs
 
@@ -27,6 +27,9 @@ test_pop: test_pop.cpp $(COMMON_SRCS)
 
 fake_server_stolen_cert: fake_server_stolen_cert.cpp $(COMMON_SRCS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
+
+mitm_proxy: mitm_proxy.cpp $(COMMON_SRCS)
+	$(CXX) $(CXXFLAGS) -pthread $^ -o $@ $(LDFLAGS)
 
 certs: ca_cert.pem server_cert.pem
 

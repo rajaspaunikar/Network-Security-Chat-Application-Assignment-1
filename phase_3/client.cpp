@@ -224,7 +224,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    X509* ca_cert = cert_load_from_file("ca_cert.pem");
+    X509* ca_cert = cert_load_from_file("certs/ca_cert.pem");
     if (!ca_cert) {
         std::cerr << "Could not load trusted CA certificate (ca_cert.pem)\n";
         close(sockfd);

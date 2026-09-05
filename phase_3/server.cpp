@@ -391,14 +391,14 @@ int main(int argc, char** argv) {
 
     BIGNUM* p = dh_load_prime();
     BIGNUM* g = dh_load_generator();
-    std::string cert_pem = read_file_to_string("server_cert.pem");
+    std::string cert_pem = read_file_to_string("certs/server_cert.pem");
     if (cert_pem.empty()) {
-        std::cerr << "Could not read server_cert.pem\n";
+        std::cerr << "Could not read certs/server_cert.pem\n";
         return 1;
     }
-    EVP_PKEY* server_privkey = load_private_key_from_file("server_key.pem");
+    EVP_PKEY* server_privkey = load_private_key_from_file("certs/server_key.pem");
     if (!server_privkey) {
-        std::cerr << "Could not load server_key.pem\n";
+        std::cerr << "Could not load certs/server_key.pem\n";
         return 1;
     }
 
