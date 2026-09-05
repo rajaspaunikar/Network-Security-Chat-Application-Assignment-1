@@ -7,6 +7,8 @@
 #include <cctype>
 #include <csignal>
 #include <cstdint>
+#include <sstream>
+#include <iomanip>
 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -14,6 +16,7 @@
 #include <unistd.h>
 
 #include <openssl/bn.h>
+#include <openssl/rand.h>
 #include "dh/dh.h"
 #include "crypto/crypto.h"
 #include "cert.h"
@@ -221,7 +224,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    X509* ca_cert = cert_load_from_file("certs/ca_cert.pem");
+    X509* ca_cert = cert_load_from_file("ca_cert.pem");
     if (!ca_cert) {
         std::cerr << "Could not load trusted CA certificate (ca_cert.pem)\n";
         close(sockfd);
@@ -264,6 +267,48 @@ int main(int argc, char** argv) {
 
     std::cout << "Server certificate validated. CN=" << cn
               << ", signed by trusted CA. Proceeding.\n";
+
+    unsigned char nonce_bytes[16];
+    RAND_bytes(nonce_bytes, sizeof(nonce_bytes));
+    std::ostringstream nonce_hex;
+    for (int i = 0; i < 16; i++) {
+        nonce_hex << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(nonce_bytes[i]);
+    }
+    std::string challenge = nonce_hex.str();
+
+    if (!send_framed(sockfd, "CHALLENGE|" + challenge)) {
+        std::cerr << "Failed to send challenge\n";
+        close(sockfd);
+        return 1;
+    }
+
+    std::string proof_frame;
+    if (!recv_framed(sockfd, proof_frame)) {
+        std::cerr << "Server closed connection before sending proof\n";
+        close(sockfd);
+        return 1;
+    }
+    auto proof_parts = parse_frame(proof_frame);
+    if (proof_parts.empty() || proof_parts[0] != "PROOF" || proof_parts.size() < 2) {
+        std::cerr << "Expected PROOF from server. Aborting.\n";
+        close(sockfd);
+        return 1;
+    }
+
+    std::string sig_hex = proof_parts[1];
+    std::string signature;
+    for (size_t i = 0; i + 1 < sig_hex.size(); i += 2) {
+        signature.push_back(static_cast<char>(std::stoi(sig_hex.substr(i, 2), nullptr, 16)));
+    }
+
+    EVP_PKEY* server_pubkey = cert_get_pubkey(server_cert);
+    if (!verify_signature(server_pubkey, challenge, signature)) {
+        std::cerr << "PROOF OF POSSESSION FAILED: server could not prove it holds the "
+                     "private key matching its certificate. Aborting.\n";
+        close(sockfd);
+        return 1;
+    }
+    std::cout << "Proof of possession verified - server genuinely holds the certificate's private key.\n";
 
     BN_CTX* ctx = BN_CTX_new();
     BIGNUM* p = dh_load_prime();

@@ -255,10 +255,41 @@ bool perform_dh_handshake(int client_fd, BIGNUM* p, BIGNUM* g, BN_CTX* ctx, BIGN
     return true;
 }
 
-void handle_client(int client_fd, BIGNUM* p, BIGNUM* g, const std::string& cert_pem) {
+void handle_client(int client_fd, BIGNUM* p, BIGNUM* g, const std::string& cert_pem, EVP_PKEY* server_privkey) {
     BN_CTX* ctx = BN_CTX_new();
 
     if (!send_framed_safe(client_fd, "CERT|" + cert_pem)) {
+        close(client_fd);
+        BN_CTX_free(ctx);
+        return;
+    }
+
+    std::string challenge_frame;
+    if (!recv_framed(client_fd, challenge_frame)) {
+        close(client_fd);
+        BN_CTX_free(ctx);
+        return;
+    }
+    auto challenge_parts = parse_frame(challenge_frame);
+    if (challenge_parts.empty() || challenge_parts[0] != "CHALLENGE" || challenge_parts.size() < 2) {
+        log(LogLevel::WARN, "Expected CHALLENGE from client, got something else.");
+        close(client_fd);
+        BN_CTX_free(ctx);
+        return;
+    }
+
+    std::string signature;
+    if (!sign_data(server_privkey, challenge_parts[1], signature)) {
+        log(LogLevel::ERR, "Failed to sign challenge with private key.");
+        close(client_fd);
+        BN_CTX_free(ctx);
+        return;
+    }
+
+    std::ostringstream sig_hex;
+    for (unsigned char c : signature) sig_hex << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(c);
+
+    if (!send_framed_safe(client_fd, "PROOF|" + sig_hex.str())) {
         close(client_fd);
         BN_CTX_free(ctx);
         return;
@@ -360,9 +391,14 @@ int main(int argc, char** argv) {
 
     BIGNUM* p = dh_load_prime();
     BIGNUM* g = dh_load_generator();
-    std::string cert_pem = read_file_to_string("certs/server_cert.pem");
+    std::string cert_pem = read_file_to_string("server_cert.pem");
     if (cert_pem.empty()) {
         std::cerr << "Could not read server_cert.pem\n";
+        return 1;
+    }
+    EVP_PKEY* server_privkey = load_private_key_from_file("server_key.pem");
+    if (!server_privkey) {
+        std::cerr << "Could not load server_key.pem\n";
         return 1;
     }
 
@@ -400,7 +436,7 @@ int main(int argc, char** argv) {
         inet_ntop(AF_INET, &client_addr.sin_addr, ip, sizeof(ip));
         log(LogLevel::INFO, "New TCP connection from " + std::string(ip));
 
-        std::thread(handle_client, client_fd, p, g, cert_pem).detach();
+        std::thread(handle_client, client_fd, p, g, cert_pem, server_privkey).detach();
     }
 
     BN_free(p);

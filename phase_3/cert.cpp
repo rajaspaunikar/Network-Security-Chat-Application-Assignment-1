@@ -2,6 +2,7 @@
 #include <openssl/pem.h>
 #include <fstream>
 #include <sstream>
+#include <vector>
 
 std::string read_file_to_string(const std::string& path) {
     std::ifstream f(path);
@@ -53,4 +54,61 @@ std::string cert_get_cn(X509* cert) {
     char cn[256];
     X509_NAME_get_text_by_NID(name, NID_commonName, cn, sizeof(cn));
     return std::string(cn);
+}
+
+EVP_PKEY* cert_get_pubkey(X509* cert) {
+    return X509_get_pubkey(cert);
+}
+
+EVP_PKEY* load_private_key_from_file(const std::string& path) {
+    FILE* f = fopen(path.c_str(), "r");
+    if (!f) return nullptr;
+    EVP_PKEY* pkey = PEM_read_PrivateKey(f, nullptr, nullptr, nullptr);
+    fclose(f);
+    return pkey;
+}
+
+bool sign_data(EVP_PKEY* privkey, const std::string& data, std::string& signature_out) {
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    if (!ctx) return false;
+
+    if (EVP_DigestSignInit(ctx, nullptr, EVP_sha256(), nullptr, privkey) != 1) {
+        EVP_MD_CTX_free(ctx);
+        return false;
+    }
+
+    size_t sig_len = 0;
+    if (EVP_DigestSign(ctx, nullptr, &sig_len,
+                        reinterpret_cast<const unsigned char*>(data.data()), data.size()) != 1) {
+        EVP_MD_CTX_free(ctx);
+        return false;
+    }
+
+    std::vector<unsigned char> sig(sig_len);
+    if (EVP_DigestSign(ctx, sig.data(), &sig_len,
+                        reinterpret_cast<const unsigned char*>(data.data()), data.size()) != 1) {
+        EVP_MD_CTX_free(ctx);
+        return false;
+    }
+
+    signature_out.assign(reinterpret_cast<char*>(sig.data()), sig_len);
+    EVP_MD_CTX_free(ctx);
+    return true;
+}
+
+bool verify_signature(EVP_PKEY* pubkey, const std::string& data, const std::string& signature) {
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    if (!ctx) return false;
+
+    if (EVP_DigestVerifyInit(ctx, nullptr, EVP_sha256(), nullptr, pubkey) != 1) {
+        EVP_MD_CTX_free(ctx);
+        return false;
+    }
+
+    int result = EVP_DigestVerify(ctx,
+        reinterpret_cast<const unsigned char*>(signature.data()), signature.size(),
+        reinterpret_cast<const unsigned char*>(data.data()), data.size());
+
+    EVP_MD_CTX_free(ctx);
+    return result == 1;
 }
